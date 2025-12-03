@@ -28,6 +28,41 @@ from tqdm import tqdm
 _thread_local: threading.local = threading.local()
 
 
+LANGUAGE_CONFIG: Dict[str, Dict[str, str]] = {
+    "zh": {
+        "task": (
+            "Translate each English sentence into Simplified Chinese while preserving the original "
+            "coordination structure, clause order, and conjunctions. Keep the sentence in the form "
+            "\"[分句A]，[连词][分句B]\" so the conjunction remains the first word after the comma, "
+            "and keep the sentence length close to the original."
+        ),
+        "rules": (
+            "- Detect coordinating conjunctions (and, but, or, so, for, nor, yet).\n"
+            "- Translate them into explicit Chinese connectors such as 并且/而且, 但是/然而, 或者/或, "
+            "所以/因此, 既不...也不 for 'nor', and 然而/不过 for 'yet'.\n"
+            "- Do not delete, paraphrase, or move the conjunction; it must appear immediately after the comma.\n"
+            "- If the English sentence has no coordinating conjunction, keep the clause structure faithful without inventing one.\n"
+            "- Always use the Chinese comma character (，) between clauses."
+        ),
+    },
+    "fr": {
+        "task": (
+            "Translate each English sentence into French while preserving the original coordination "
+            "structure, clause order, and conjunctions. Keep the sentence in the form "
+            "\"[Proposition A], [Conjonction] Proposition B\" so the conjunction remains the first word "
+            "after the comma, and keep the sentence length close to the original."
+        ),
+        "rules": (
+            "- Detect coordinating conjunctions (and, but, or, so, for, nor, yet).\n"
+            "- Translate them into explicit French connectors such as et, mais, ou, donc, car, ni, pourtant.\n"
+            "- Do not delete, paraphrase, or relocate the conjunction; it must appear immediately after the comma.\n"
+            "- If the English sentence lacks a coordinating conjunction, mirror the clause structure faithfully without inventing one.\n"
+            "- Always use the standard comma (,) between clauses and respect French spacing conventions."
+        ),
+    },
+}
+
+
 @dataclass
 class Record:
     """Represents a single line from the probing dataset."""
@@ -129,6 +164,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable verbose console logging.",
     )
+    parser.add_argument(
+        "--target_lang",
+        type=str,
+        choices=sorted(LANGUAGE_CONFIG.keys()),
+        default="zh",
+        help="Target language for translation (default: zh).",
+    )
     return parser.parse_args()
 
 
@@ -198,20 +240,14 @@ def sanitize_translation(text: str) -> str:
     return cleaned.strip()
 
 
-def build_prompt(batch: List[Record]) -> str:
+def build_prompt(batch: List[Record], target_lang: str) -> str:
     numbered = "\n".join(f"{idx + 1}. {item.text}" for idx, item in enumerate(batch))
+    config = LANGUAGE_CONFIG[target_lang]
     prompt = (
         "Role: Professional computational linguist and translator.\n\n"
-        "Task: Translate each English sentence into Simplified Chinese while preserving the "
-        "original coordination structure, clause order, and conjunctions. Keep the sentence in the "
-        "form \"[Clause A]，[Conjunction] Clause B\" so the conjunction remains the first word after "
-        "the comma, and keep the sentence length close to the original.\n\n"
+        f"Task: {config['task']}\n\n"
         "Coordination rules:\n"
-        "- Detect coordinating conjunctions (and, but, or, so, for, nor, yet).\n"
-        "- Translate them into explicit Chinese connectors such as 并且/而且, 但是/然而, 或者/或, 所以/因此.\n"
-        "- Do not delete, paraphrase, or move the conjunction; it must appear immediately after the comma.\n"
-        "- If the English sentence lacks a coordinating conjunction, keep the clause structure faithful without inventing one.\n"
-        "- Always use the Chinese comma character (，) between clauses.\n\n"
+        f"{config['rules']}\n\n"
         "Output Requirements:\n"
         "1. Return ONLY the translations.\n"
         "2. Each translation must be on its own line.\n"
@@ -227,9 +263,10 @@ def translate_batch(
     batch: List[Record],
     api_key: str,
     model: str,
+    target_lang: str,
 ) -> List[str]:
     client = get_client(api_key)
-    prompt = build_prompt(batch)
+    prompt = build_prompt(batch, target_lang)
 
     response = client.models.generate_content(
         model=model,
@@ -264,11 +301,12 @@ def translate_with_retries(
     max_retries: int,
     backoff: float,
     sleep_after_error: float,
+    target_lang: str,
 ) -> Optional[List[str]]:
     delay = backoff
     for attempt in range(1, max_retries + 1):
         try:
-            return translate_batch(batch, api_key, model)
+            return translate_batch(batch, api_key, model, target_lang)
         except Exception as exc:
             logging.warning(
                 "Batch starting at line %d failed on attempt %d/%d: %s",
@@ -299,6 +337,7 @@ def process_batches(
     retry_backoff: float,
     sleep_after_error: float,
     max_workers: int,
+    target_lang: str,
 ) -> Tuple[Dict[int, str], int]:
     translations: Dict[int, str] = {}
     fallback_failures = 0
@@ -314,6 +353,7 @@ def process_batches(
                 max_retries,
                 retry_backoff,
                 sleep_after_error,
+                target_lang,
             )
             future_map[future] = batch
 
@@ -339,6 +379,7 @@ def process_batches(
                         max_retries,
                         retry_backoff,
                         sleep_after_error,
+                        target_lang,
                     )
                     if single_result:
                         translations[record.idx] = single_result[0]
@@ -377,6 +418,7 @@ def main() -> None:
 
     api_key = get_api_key()
     logging.info("Using Gemini model: %s", args.model)
+    logging.info("Target language: %s", args.target_lang)
 
     records = load_records(args.input_file)
     if not records:
@@ -416,6 +458,7 @@ def main() -> None:
         retry_backoff=args.retry_backoff,
         sleep_after_error=args.sleep_after_error,
         max_workers=args.max_workers,
+        target_lang=args.target_lang,
     )
     elapsed = time.time() - start_time
 
